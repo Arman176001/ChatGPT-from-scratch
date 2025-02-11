@@ -89,7 +89,7 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.transformer.wte.weight = self.lm_head.weight
+        self.lm_head.weight = self.transformer.wte.weight
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -239,31 +239,33 @@ max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 715
 max_steps = 19073
+
 def get_lr(it):
     if it < warmup_steps:
         return max_lr * (it + 1) / warmup_steps
-    if it > warmup_steps:
+    elif it >= max_steps:
         return min_lr
-    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
-    assert 0<= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    return min_lr + coeff * (max_lr - min_lr)
+    else:
+        decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+        assert 0 <= decay_ratio <= 1
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+        return min_lr + coeff * (max_lr - min_lr)
 
-optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-7, device= device)
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-7, device=device)
 
 for step in range(max_steps):
     t0 = time.time()
-    if step%100 ==0:
+    if step % 100 == 0:
         model.eval()
         val_loader.reset()
         with torch.no_grad():
             val_loss_accum = torch.zeros(1, device=device)
             val_loss_steps = 20
             for _ in range(val_loss_steps):
-                x , y = val_loader.next_batch()
-                x , y = x.to(device), y.to(device)
+                x, y = val_loader.next_batch()
+                x, y = x.to(device), y.to(device)
                 with torch.autocast(device, dtype=torch.bfloat16):
-                    logits, loss = model(x,y)
+                    logits, loss = model(x, y)
                 loss = loss / grad_accum_steps
                 val_loss_accum += loss.detach()
             if ddp:
@@ -272,7 +274,8 @@ for step in range(max_steps):
                 print(f"Val loss: {val_loss_accum.item():.4f}")
                 with open(log_file, 'a') as f:
                     f.write(f"Val loss: {val_loss_accum.item():.4f}\n")
-                if step > 0 and (step % 5000 ==0 or last_step):
+                # save checkpoint every 5000 steps or at the final step
+                if step > 0 and (step % 5000 == 0 or step == max_steps - 1):
                     checkpoint_path = os.path.join(log_dir, f"checkpoint_{step}.pt")
                     checkpoint = {
                         'model': model.state_dict(),
@@ -281,7 +284,6 @@ for step in range(max_steps):
                         'val_loss': val_loss_accum.item()
                     }
                     torch.save(checkpoint, checkpoint_path)
-                    last_step = step
 
     optimizer.zero_grad()
     loss_accum = 0.0
@@ -297,14 +299,15 @@ for step in range(max_steps):
         loss.backward()
     if ddp:
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(),1.0)
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     optimizer.step()
-    torch.cuda.synchronize()
+    if device.startswith('cuda'):
+        torch.cuda.synchronize()
     t1 = time.time()
-    dt = (t1-t0)
+    dt = (t1 - t0)
     tokens_per_sec = (train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size) / dt
     if master_process:
         print(f"Step {step:4d} | loss: {loss.item()} | norm: {norm} | dt: {dt*1000:.2f}ms, tok/sec: {tokens_per_sec:.2f}")

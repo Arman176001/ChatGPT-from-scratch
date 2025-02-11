@@ -1,1 +1,4 @@
 .vscode/
+out
+__pycache__
+checkpoint_step_800.pt
